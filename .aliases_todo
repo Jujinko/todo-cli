@@ -1,0 +1,215 @@
+# ~/.aliases_todo - alias loading file for managing todo files
+
+# --- Konfiguration ---
+export TODO_BASE_DIR="$HOME/notes/todo/daily"
+export TODO_TEMPLATE_DIR="$HOME/notes/todo/templates"
+export TODO_OP_LOG="$HOME/notes/todo/operations.log"
+
+# --- Helper: Log-Events dokumentieren ---
+function _todo_log_event() {
+    local action="$1"  # z.B. "CREATED", "FILLER", "SKIPPED", "MIGRATED"
+    local target="$2"  # Die betroffene Datei
+    local reason="$3"  # Status (Krank, Urlaub, etc.)
+    
+    # Sicherstellen, dass das Verzeichnis existiert
+    local LOG_DIR=$(dirname "$TODO_OP_LOG")
+    [ ! -d "$LOG_DIR" ] && mkdir -p "$LOG_DIR"
+    
+    # Sicherstellen, dass das Logfile existiert
+    touch "$TODO_OP_LOG"
+    
+    # Format: Zeitstempel | Aktion | Datei | Grund
+    printf "%-19s | %-7s | %-14s | %s\n" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$action" \
+        "$target" \
+        "$reason" >> "$TODO_OP_LOG"
+}
+
+# --- Helper: Template Renderer ---
+function _todo_render() {
+    local TPL_NAME="$1"
+    local DATE_STR="$2"
+    local TITLE_STR="$3"
+    local TPL_FILE="$TODO_TEMPLATE_DIR/${TPL_NAME}.txt"
+    if [ -f "$TPL_FILE" ]; then
+        sed -e "s/{{DATE}}/$DATE_STR/g" -e "s/{{TITLE}}/$TITLE_STR/g" "$TPL_FILE"
+    else
+        # Fallback Layout (Wichtig für Migration Logic)
+        echo "DATE: $DATE_STR ($TITLE_STR)"
+        echo "================================================================================"
+        echo ""
+        echo "[PLAN]"
+        echo "[ ] "
+        echo ""
+        echo "[LOG]"
+        echo "Start | Dur  | Ticket     | Activity"
+        echo "------+------+------------+---------------------------------------------------"
+        echo ""
+        echo "[NOTES]"
+        echo "________________________________________________________________________________"
+    fi
+}
+
+# --- Helper: Auto-Migrate Tasks ---
+# Pulls ANY task with brackets [...] that is NOT [x] from Source to Target
+function _todo_auto_migrate() {
+    local SRC="$1"
+    local DEST="$2"
+
+    [ ! -f "$SRC" ] || [ ! -f "$DEST" ] && return 1
+
+    # 1. Extract lines between [PLAN] and [LOG]
+    # 2. Grep for lines containing brackets "[" (Task indicators)
+    # 3. Exclude lines containing "[x]" (Completed)
+    local TASKS=$(sed -n '/\[PLAN\]/,/\[LOG\]/p' "$SRC" | grep "\[.*\]" | grep -v "\[x\]")
+
+    if [ -n "$TASKS" ]; then
+        # Use a temporary file to inject tasks cleanly
+        local TMP=$(mktemp)
+        
+        # Read Dest up to [PLAN]
+        sed -n '1,/\[PLAN\]/p' "$DEST" > "$TMP"
+        
+        # Insert Migrated Tasks
+        echo "$TASKS" >> "$TMP"
+        
+        # Read the rest of Dest (after [PLAN])
+        sed -n '/\[PLAN\]/{n; :a; n; p; ba;}' "$DEST" >> "$TMP"
+        
+        # Overwrite Destination
+        mv "$TMP" "$DEST"
+        
+        _todo_log_event "MIGRATED" "$(basename "$DEST")" "Tasks pulled from $(basename "$SRC")"
+    fi
+}
+
+# --- Core Logic: Lückenfüller ---
+function _todo_fill_gaps() {
+    [ ! -d "$TODO_BASE_DIR" ] && mkdir -p "$TODO_BASE_DIR" && return 0
+    local LAST_FILE=$(ls -1 "$TODO_BASE_DIR" 2>/dev/null | grep -E '^[0-9]{4}_[0-9]{2}_[0-9]{2}\.txt$' | sort | tail -n 1)
+    if [ -z "$LAST_FILE" ]; then return 0; fi
+    local LAST_DATE_RAW=${LAST_FILE%.txt}
+    local CURR_DATE=$(date -d "${LAST_DATE_RAW//_/-} + 1 day" +%Y-%m-%d)
+    local END_DATE=$(date +%Y-%m-%d)
+
+    while [[ "$CURR_DATE" < "$END_DATE" ]]; do
+        local FNAME_DATE=$(date -d "$CURR_DATE" +%Y_%m_%d)
+        local PRETTY_DATE=$(date -d "$CURR_DATE" "+%Y-%m-%d (%A)")
+        local FILE_PATH="$TODO_BASE_DIR/${FNAME_DATE}.txt"
+        
+        # Wochenenden überspringen (Wird nicht geloggt)
+        if [ $(( $(date -d "$CURR_DATE" +%u) )) -gt 5 ]; then
+            CURR_DATE=$(date -d "$CURR_DATE + 1 day" +%Y-%m-%d)
+            continue
+        fi
+        
+        [ -f "$FILE_PATH" ] && CURR_DATE=$(date -d "$CURR_DATE + 1 day" +%Y-%m-%d) && continue
+
+        echo "--------------------------------------------------"
+        echo "⚠️  Lücke entdeckt am: $PRETTY_DATE"
+        echo "   1) 🤒 Krank  2) 🌴 Urlaub  3) 📅 Feiertag  4) ⚡ Nachtrag  5) ⏩ Skip"
+        read -p "   Auswahl: " CHOICE
+        
+        local STATUS=""
+        case $CHOICE in
+            1) STATUS="Krank";    _todo_render "sick" "$PRETTY_DATE" "$STATUS" >> "$FILE_PATH" ;;
+            2) STATUS="Urlaub";   _todo_render "vacation" "$PRETTY_DATE" "$STATUS" >> "$FILE_PATH" ;;
+            3) STATUS="Feiertag"; _todo_render "holiday" "$PRETTY_DATE" "$STATUS" >> "$FILE_PATH" ;;
+            4) STATUS="Nachtrag"; _todo_render "daily" "$PRETTY_DATE" "" >> "$FILE_PATH" ;;
+            *) STATUS="SKIPPED";  ;;
+        esac
+
+        if [ "$STATUS" == "SKIPPED" ]; then
+            _todo_log_event "SKIPPED" "${FNAME_DATE}.txt" "Vom User übersprungen"
+        else
+            _todo_log_event "FILLER" "${FNAME_DATE}.txt" "$STATUS"
+        fi
+        
+        CURR_DATE=$(date -d "$CURR_DATE + 1 day" +%Y-%m-%d)
+    done
+}
+
+# --- Command: TODO ---
+function todo() {
+    # 1. Fill Gaps first
+    _todo_fill_gaps
+
+    local TODAY_FNAME="$(date +%Y_%m_%d).txt"
+    local TODAY_PATH="$TODO_BASE_DIR/$TODAY_FNAME"
+    local PRETTY_DATE="$(date "+%Y-%m-%d (%A)")"
+    local NEWLY_CREATED=false
+
+    # 2. Create today if missing
+    if [ ! -f "$TODAY_PATH" ]; then
+        NEWLY_CREATED=true
+        _todo_render "daily" "$PRETTY_DATE" "" >> "$TODAY_PATH"
+        _todo_log_event "CREATED" "$TODAY_FNAME" "Initial Daily Start"
+        
+        # --- MIGRATION LOGIC START ---
+        # Find the most recent existing file (excluding today)
+        local LAST_FILE=$(ls -1 "$TODO_BASE_DIR" 2>/dev/null | grep -E '^[0-9]{4}_[0-9]{2}_[0-9]{2}\.txt$' | grep -v "$TODAY_FNAME" | sort | tail -n 1)
+        
+        if [ -n "$LAST_FILE" ]; then
+            # Pull unfinished tasks from Last File -> Today
+            _todo_auto_migrate "$TODO_BASE_DIR/$LAST_FILE" "$TODAY_PATH"
+        fi
+        # --- MIGRATION LOGIC END ---
+    fi
+
+    # 3. Open Vim
+    # Logic: Jump to first [ ] (Open Task)
+    if [ "$NEWLY_CREATED" = true ]; then
+        local LAST_FILE_AGAIN=$(ls -1 "$TODO_BASE_DIR" 2>/dev/null | grep -E '^[0-9]{4}_[0-9]{2}_[0-9]{2}\.txt$' | grep -v "$TODAY_FNAME" | sort | tail -n 1)
+        if [ -n "$LAST_FILE_AGAIN" ]; then
+            # Split view for context
+            vim -O "$TODO_BASE_DIR/$LAST_FILE_AGAIN" "$TODAY_PATH" -c "wincmd l" -c "+/\[ \]"
+        else
+            vim "+/\[ \]" "$TODAY_PATH"
+        fi
+    else
+        # Just open today
+        vim "+/\[ \]" "$TODAY_PATH"
+    fi
+}
+
+# --- Command: YODO ---
+function yodo() {
+    _todo_fill_gaps
+    local LAST_FILE=$(ls -1 "$TODO_BASE_DIR" 2>/dev/null | grep -E '^[0-9]{4}_[0-9]{2}_[0-9]{2}\.txt$' | grep -v "$(date +%Y_%m_%d)" | sort | tail -n 1)
+    [ -z "$LAST_FILE" ] && echo "⚠️  Kein altes File gefunden." && return 1
+    vim "$TODO_BASE_DIR/$LAST_FILE"
+}
+
+# --- Command: SODO (Enhanced) ---
+function sodo() {
+    if [ -z "$1" ]; then
+        echo "Usage: sodo <search_term>"
+        return 1
+    fi
+    # -E = Extended Regex, -i = Case Insensitive
+    grep --color=always -rnH -E -i "$@" "$TODO_BASE_DIR" | sort -r
+}
+
+# --- Command: Quick Note ---
+function note() {
+    local TODAY_FNAME="$(date +%Y_%m_%d).txt"
+    local TODAY_PATH="$TODO_BASE_DIR/$TODAY_FNAME"
+    
+    # If today doesn't exist, create it via todo logic first
+    if [ ! -f "$TODAY_PATH" ]; then
+        todo
+    fi
+
+    local TIMESTAMP="$(date +%H:%M)"
+    if [ -z "$1" ]; then
+        # If no arguments, just print the tail of today's note
+        tail -n 5 "$TODAY_PATH"
+    else
+        # Append the note with a timestamp
+        # Inserts BEFORE the last line (Footer) using sed $i
+        local NOTE_CONTENT="[$TIMESTAMP]: $*"
+        sed -i "\$i $NOTE_CONTENT" "$TODAY_PATH"
+        echo "✅ Added to $TODAY_FNAME"
+    fi
+}
